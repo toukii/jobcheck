@@ -3,6 +3,7 @@ package jobcheck
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -13,6 +14,7 @@ type JobChecker struct {
 	capacity         chan []string
 	check            func(keys []string) error
 	clean, cleanmask int // 清理hit的标记
+	sync.Mutex
 }
 
 func NewJobChecker(timer, exempt time.Duration, check func(keys []string) error) *JobChecker {
@@ -20,8 +22,8 @@ func NewJobChecker(timer, exempt time.Duration, check func(keys []string) error)
 		timer:     timer,
 		exempt:    exempt,
 		check:     check,
-		hit:       make(map[string]int64, 10),
-		capacity:  make(chan []string, 10),
+		hit:       make(map[string]int64, 2048),
+		capacity:  make(chan []string, 4),
 		ticker:    time.NewTicker(timer),
 		cleanmask: 8,
 	}
@@ -46,6 +48,9 @@ func (jc *JobChecker) cleanHit() {
 	}
 	jc.clean = 0
 
+	jc.Lock()
+	defer jc.Unlock()
+
 	last := time.Now().Add(-1 * jc.exempt).Unix()
 	for key, pre := range jc.hit {
 		if pre <= last {
@@ -60,28 +65,34 @@ func (jc *JobChecker) Loop() {
 		keys := <-jc.capacity
 		last := time.Now().Add(-1 * jc.exempt).Unix()
 
-		idx := 0
-		for i, key := range keys {
-			pre, ex := jc.hit[key]
-			if ex && pre > last {
-				continue
+		func() {
+			jc.Lock()
+			defer jc.Unlock()
+
+			idx := 0
+			for i, key := range keys {
+				pre, ex := jc.hit[key]
+				if ex && pre > last {
+					continue
+				}
+				if idx != i {
+					keys[idx] = keys[i]
+				}
+				idx++
 			}
-			if idx != i {
-				keys[idx] = keys[i]
+			if idx <= 0 {
+				fmt.Println("#! check ", keys[:idx])
+				return
 			}
-			idx++
-		}
-		if idx <= 0 {
-			fmt.Println("#! check ", keys[:idx])
-			continue
-		}
-		if err := jc.check(keys[:idx]); err != nil {
-			fmt.Println("cherr err:", err)
-		} else {
-			now := time.Now().Unix()
-			for i := 0; i < idx; i++ {
-				jc.hit[keys[i]] = now + int64(rand.Intn(int(jc.exempt.Seconds())))
+			if err := jc.check(keys[:idx]); err != nil {
+				fmt.Println("cherr err:", err)
+			} else {
+				now := time.Now().Unix()
+				for i := 0; i < idx; i++ {
+					jc.hit[keys[i]] = now + int64(rand.Intn(int(jc.exempt.Seconds())))
+				}
 			}
-		}
+
+		}()
 	}
 }
